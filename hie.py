@@ -1,4 +1,4 @@
-# MouthMorse.py  ——  Use your mouth to type Morse code (short=·, long=—)
+
 import cv2
 import numpy as np
 import mediapipe as mp
@@ -24,8 +24,8 @@ MOUTH_VERT_BOTTOM = 14
 MOUTH_LEFT        = 61
 MOUTH_RIGHT       = 291
 
-YAW_DEAD_DEG   = 45.0
-PITCH_DEAD_DEG = 5.0
+YAW_DEAD_DEG   = 55.0
+PITCH_DEAD_DEG = 7.0
 GAIN_X         = 10.0
 GAIN_Y         = 10.0
 SMOOTH_ALPHA   = 0.25
@@ -58,6 +58,50 @@ MODEL_POINTS = np.array([
 
 EYE_L = dict(U=159, D=145, L=33,  R=133)
 EYE_R = dict(U=386, D=374, L=263, R=362)
+# --- Eyebrow-raise click config ---
+BROW_RAISE_MULT   = 1.18   # ratio above neutral to count as "raised"
+BROW_RELEASE_MULT = 1.08   # fall-back threshold to rearm after a raise
+BROW_MIN_GAP_S    = 0.30   # min seconds between clicks (debounce)
+
+# FaceMesh landmark IDs for brows/eyes
+# Left brow upper-mid: 105, Right brow upper-mid: 334
+# Left eye top: 159, Right eye top: 386
+# Eye corners for width normalization
+L_EYE = dict(UP=159, L=33,  R=133)
+R_EYE = dict(UP=386, L=263, R=362)
+L_BROW_UP = 105
+R_BROW_UP = 334
+
+def _pt(lm, idx, w, h):
+    return np.array([lm[idx].x * w, lm[idx].y * h], dtype=np.float64)
+
+def brow_raise_ratio(lm, w, h):
+    """
+    Scale-invariant eyebrow height metric:
+    avg( (brow_up - eye_upper)_vert_distance / eye_width )
+    Larger => brows higher.
+    """
+    # Left eye
+    pL_up  = _pt(lm, L_EYE['UP'], w, h)
+    pL_l   = _pt(lm, L_EYE['L'],  w, h)
+    pL_r   = _pt(lm, L_EYE['R'],  w, h)
+    pLb_up = _pt(lm, L_BROW_UP,   w, h)
+
+    # Right eye
+    pR_up  = _pt(lm, R_EYE['UP'], w, h)
+    pR_l   = _pt(lm, R_EYE['L'],  w, h)
+    pR_r   = _pt(lm, R_EYE['R'],  w, h)
+    pRb_up = _pt(lm, R_BROW_UP,   w, h)
+
+    # vertical distances (abs y-diff) and eye widths
+    dL = abs(pLb_up[1] - pL_up[1])
+    dR = abs(pRb_up[1] - pR_up[1])
+    wL = np.linalg.norm(pL_l - pL_r)
+    wR = np.linalg.norm(pR_l - pR_r)
+
+    rL = dL / max(wL, 1e-6)
+    rR = dR / max(wR, 1e-6)
+    return 0.5 * (rL + rR)
 
 def euclid(a,b): return np.linalg.norm(a-b)
 
@@ -81,8 +125,8 @@ MORSE = {
     ".....":"5","-....":"6","--...":"7","---..":"8","----.":"9"
 }
 
-LETTER_GAP = 1.6
-WORD_GAP   = 1.6
+LETTER_GAP = 0.9
+WORD_GAP   = 2.2
 DOT_MAX    = 0.25
 DASH_MIN   = 0.30
 
@@ -131,9 +175,27 @@ def calibrate(cap,  secs_hold=3.0):
     MAR_OPEN_T  = max(MAR_OPEN_T,  closed + 0.05)
     MAR_CLOSE_T = min(MAR_CLOSE_T, opened - 0.05)
 
-    print(f"[Calibration] closed={closed:.3f}, opened={opened:.3f} -> "
-          f"OPEN_T={MAR_OPEN_T:.3f}, CLOSE_T={MAR_CLOSE_T:.3f}")
-    return MAR_OPEN_T, MAR_CLOSE_T
+    print("Calibration Phase 3: Relax your eyebrows (neutral) for ~1.5s...")
+    vals = []
+    t0 = time.time()
+    while time.time() - t0 < 1.5:
+        ok, fr = cap.read()
+        if not ok: continue
+        H, W = fr.shape[:2]
+        rgb = cv2.cvtColor(fr, cv2.COLOR_BGR2RGB)
+        res = face_mesh.process(rgb)
+        if res.multi_face_landmarks:
+            lm = res.multi_face_landmarks[0].landmark
+            vals.append(brow_raise_ratio(lm, W, H))
+        cv2.putText(fr, "Keep eyebrows neutral...", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+        cv2.imshow("Mouth Morse", fr)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            return None
+    brow_neutral = np.median(vals) if vals else 0.10  # fallback small number
+
+    print(f"[Calibration] Brow neutral ratio ≈ {brow_neutral:.3f}")
+    return (MAR_OPEN_T, MAR_CLOSE_T, brow_neutral)
 
 def eye_aspect_ratio(landmarks, eye_idx, w, h):
     pU = np.array([landmarks[eye_idx['U']].x * w, landmarks[eye_idx['U']].y * h])
@@ -144,7 +206,7 @@ def eye_aspect_ratio(landmarks, eye_idx, w, h):
     hlen = np.linalg.norm(pL - pR)
     return 0.0 if hlen < 1e-6 else v / hlen
 
-def get_pose_angles(landmarks, w, h):
+def  get_pose_angles(landmarks, w, h):
     pts_2d = np.array([
         [landmarks[IDX_NOSE].x * w, landmarks[IDX_NOSE].y * h],
         [landmarks[IDX_CHIN].x * w, landmarks[IDX_CHIN].y * h],
@@ -177,12 +239,14 @@ def main():
     if got is None:
         print("Calibration failed or was interrupted.")
         cap.release(); cv2.destroyAllWindows(); return
-    MAR_OPEN_T, MAR_CLOSE_T = got
+    MAR_OPEN_T, MAR_CLOSE_T, BROW_NEUTRAL = got
 
     mouth_open = False
     open_start_t = None
     cur_morse = ""
     last_event_t = time.time()
+    last_char_type = None
+    last_letter_time = 0.0
 
     missing = 0
     MISSING_LIMIT = 15
@@ -192,8 +256,8 @@ def main():
         return
 
     vx_s, vy_s = 0.0, 0.0
-    blink_q = deque(maxlen=8)
-    last_click_time = 0.0
+    last_click_time = 0
+    brow_is_up = False
     print("Start: Short mouth open(·), long mouth open(—); Pause to complete a letter; 'q' to quit.")
     with mp_face.FaceMesh(
             static_image_mode=False,
@@ -247,14 +311,21 @@ def main():
                     last_event_t = now
 
             gap = now - last_event_t
+
+            # --- Part 3: commit letter and record state ---
             if cur_morse and not mouth_open and gap > LETTER_GAP:
                 ch = MORSE.get(cur_morse, "")
                 if ch:
                     pyautogui.typewrite(ch.lower())
+                    last_char_type = 'letter'
+                    last_letter_time = now
                 cur_morse = ""
                 last_event_t = now
-            if gap > WORD_GAP and not mouth_open:
+
+            # --- Part 4: only add space after a real letter ---
+            if (not mouth_open) and (cur_morse == "") and (gap > WORD_GAP) and (last_char_type == 'letter'):
                 pyautogui.typewrite(" ")
+                last_char_type = 'space'
                 last_event_t = now
 
             if mar is not None:
@@ -277,13 +348,24 @@ def main():
                 lms = res.multi_face_landmarks[0].landmark
                 yaw, pitch = get_pose_angles(lms, w, h)
                 if yaw is not None:
-                    ear_l = eye_aspect_ratio(lms, EYE_L, w, h)
-                    ear_r = eye_aspect_ratio(lms, EYE_R, w, h)
-                    ear = (ear_l + ear_r) / 2.0
-                    blink_q.append(ear < BLINK_EAR_THR)
-                    if sum(blink_q) >= BLINK_MIN_FR and (time.time() - last_click_time) > 0.25:
+                    br = brow_raise_ratio(lms, w, h)
+
+                    # thresholds relative to neutral
+                    raise_thr = BROW_NEUTRAL * BROW_RAISE_MULT
+                    release_thr = BROW_NEUTRAL * BROW_RELEASE_MULT
+
+                    now = time.time()
+                    if not brow_is_up and br > raise_thr and (now - last_click_time) > BROW_MIN_GAP_S:
                         pyautogui.click()
-                        last_click_time = time.time()
+                        last_click_time = now
+                        brow_is_up = True
+                    elif brow_is_up and br < release_thr:
+                        brow_is_up = False
+
+                    # (Optional) On-screen debug:
+                    cv2.putText(frame, f"Brow r:{br:.3f} up:{brow_is_up} "
+                                       f"(raise>{raise_thr:.3f}/rel<{release_thr:.3f})",
+                                (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 220, 255), 2)
 
                     over_yaw = max(0.0, abs(yaw) - YAW_DEAD_DEG)
                     a = 180 - abs(pitch)
@@ -311,8 +393,9 @@ def main():
 
                     cv2.putText(frame, f"Yaw:{yaw:.1f} Pitch:{pitch:.1f}", (10, 30),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                    cv2.putText(frame, f"dx:{step_x} dy:{step_y} EAR:{ear:.2f}",
-                                (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    cv2.putText(frame, f"dx:{step_x} dy:{step_y}",
+                                    (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
             else:
                 cv2.putText(frame, "No face", (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
