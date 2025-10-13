@@ -1,4 +1,4 @@
-# **Ability Bridge**: Hands-Free Computer Control 🚀
+# **Ability Bridge**: Hands-Free Computer Control
 
 FacialHelm is an assistive technology project that transforms a standard webcam into a comprehensive, hands-free interface for computer control. This application allows users to type using Morse code with their mouth, navigate the cursor with their head, and click by blinking.
 
